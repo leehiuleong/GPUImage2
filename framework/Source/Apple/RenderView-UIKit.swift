@@ -15,6 +15,7 @@ public class RenderView:UIView, ImageConsumer {
     var displayFramebuffer:GLuint?
     var displayRenderbuffer:GLuint?
     var backingSize = GLSize(width:0, height:0)
+    private var storedFramebuffer:Framebuffer?
     
     private lazy var displayShader:ShaderProgram = {
         return sharedImageProcessingContext.passthroughShader
@@ -46,7 +47,24 @@ public class RenderView:UIView, ImageConsumer {
         eaglLayer.drawableProperties = [String(describing: NSNumber(value:false)): kEAGLDrawablePropertyRetainedBacking, kEAGLColorFormatRGBA8: kEAGLDrawablePropertyColorFormat]
     }
     
+    public override func layoutSubviews() {
+        super.layoutSubviews()
+        
+        // If the view resized, recreate the display framebuffer on next render.
+        let desiredSize = self.sizeInPixels
+        if (displayFramebuffer != nil) &&
+            ((backingSize.width != desiredSize.glWidth()) || (backingSize.height != desiredSize.glHeight())) {
+            destroyDisplayFramebuffer()
+        }
+        
+        // For still images, we may have dropped the only frame if the view was zero-sized.
+        // Once we have a valid size, render the last stored frame.
+        renderStoredFramebufferIfPossible()
+    }
+    
     deinit {
+        storedFramebuffer?.unlock()
+        storedFramebuffer = nil
         destroyDisplayFramebuffer()
     }
     
@@ -115,7 +133,7 @@ public class RenderView:UIView, ImageConsumer {
     public func newFramebufferAvailable(_ framebuffer:Framebuffer, fromSourceIndex:UInt) {
         if (displayFramebuffer == nil) {
             guard self.createDisplayFramebuffer() else {
-                framebuffer.unlock()
+                storeForRedraw(framebuffer)
                 return
             }
         }
@@ -129,6 +147,51 @@ public class RenderView:UIView, ImageConsumer {
         
         glBindRenderbuffer(GLenum(GL_RENDERBUFFER), displayRenderbuffer!)
         sharedImageProcessingContext.presentBufferForDisplay()
+    }
+    
+    private func storeForRedraw(_ framebuffer:Framebuffer) {
+        // Keep only the latest framebuffer around; release any previously stored one.
+        storedFramebuffer?.unlock()
+        storedFramebuffer = framebuffer
+        
+        // Trigger a layout pass so that once the view has a non-zero size, we can render it.
+        runAsynchronouslyOnMainQueue { [weak self] in
+            self?.setNeedsLayout()
+        }
+    }
+    
+    private func renderStoredFramebufferIfPossible() {
+        // Only attempt if we have something to draw and the view is attached.
+        guard window != nil else { return }
+        guard storedFramebuffer != nil else { return }
+        
+        sharedImageProcessingContext.runOperationAsynchronously { [weak self] in
+            guard let self else { return }
+            guard let framebuffer = self.storedFramebuffer else { return }
+            
+            if (self.displayFramebuffer == nil) {
+                guard self.createDisplayFramebuffer() else {
+                    // Keep stored framebuffer for a future attempt.
+                    return
+                }
+            }
+            
+            self.activateDisplayFramebuffer()
+            clearFramebufferWithColor(self.backgroundRenderColor)
+            
+            let scaledVertices = self.fillMode.transformVertices(
+                verticallyInvertedImageVertices,
+                fromInputSize: framebuffer.sizeForTargetOrientation(self.orientation),
+                toFitSize: self.backingSize
+            )
+            renderQuadWithShader(self.displayShader, vertices:scaledVertices, inputTextures:[framebuffer.texturePropertiesForTargetOrientation(self.orientation)])
+            
+            framebuffer.unlock()
+            self.storedFramebuffer = nil
+            
+            glBindRenderbuffer(GLenum(GL_RENDERBUFFER), self.displayRenderbuffer!)
+            sharedImageProcessingContext.presentBufferForDisplay()
+        }
     }
 }
 #endif
