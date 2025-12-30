@@ -68,6 +68,85 @@ public class RenderView:UIView, ImageConsumer {
         destroyDisplayFramebuffer()
     }
     
+    // MARK: - Snapshotting
+    //
+    // NOTE: UIKit screenshot methods like `drawHierarchy(in:afterScreenUpdates:)` will not
+    // capture OpenGL ES (CAEAGLLayer) content, often resulting in a blank image.
+    // Use this to capture the current displayed pixels instead.
+    public func captureCurrentImage(completion: @escaping (UIImage?) -> Void) {
+        sharedImageProcessingContext.runOperationAsynchronously { [weak self] in
+            guard let self else { return }
+            
+            // Ensure we have a drawable backing store.
+            if (self.displayFramebuffer == nil) {
+                guard self.createDisplayFramebuffer() else {
+                    runAsynchronouslyOnMainQueue { completion(nil) }
+                    return
+                }
+            }
+            
+            let width = Int(self.backingSize.width)
+            let height = Int(self.backingSize.height)
+            guard width > 0, height > 0 else {
+                runAsynchronouslyOnMainQueue { completion(nil) }
+                return
+            }
+            
+            glBindFramebuffer(GLenum(GL_FRAMEBUFFER), self.displayFramebuffer!)
+            glViewport(0, 0, self.backingSize.width, self.backingSize.height)
+            glFinish()
+            
+            let bytesPerPixel = 4
+            let bytesPerRow = width * bytesPerPixel
+            let byteCount = bytesPerRow * height
+            
+            let raw = UnsafeMutablePointer<UInt8>.allocate(capacity: byteCount)
+            glReadPixels(0, 0, GLsizei(width), GLsizei(height), GLenum(GL_RGBA), GLenum(GL_UNSIGNED_BYTE), raw)
+            
+            // Flip vertically (OpenGL origin is bottom-left; UIKit expects top-left).
+            let flipped = UnsafeMutablePointer<UInt8>.allocate(capacity: byteCount)
+            for y in 0..<height {
+                let src = raw.advanced(by: (height - 1 - y) * bytesPerRow)
+                let dst = flipped.advanced(by: y * bytesPerRow)
+                dst.assign(from: src, count: bytesPerRow)
+            }
+            raw.deallocate()
+            
+            guard let provider = CGDataProvider(
+                dataInfo: nil,
+                data: flipped,
+                size: byteCount,
+                releaseData: renderViewDataProviderReleaseCallback
+            ) else {
+                flipped.deallocate()
+                runAsynchronouslyOnMainQueue { completion(nil) }
+                return
+            }
+            
+            let colorSpace = CGColorSpaceCreateDeviceRGB()
+            let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+            guard let cgImage = CGImage(
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bitsPerPixel: 32,
+                bytesPerRow: bytesPerRow,
+                space: colorSpace,
+                bitmapInfo: bitmapInfo,
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: true,
+                intent: .defaultIntent
+            ) else {
+                runAsynchronouslyOnMainQueue { completion(nil) }
+                return
+            }
+            
+            let image = UIImage(cgImage: cgImage, scale: self.contentScaleFactor, orientation: .up)
+            runAsynchronouslyOnMainQueue { completion(image) }
+        }
+    }
+    
     @discardableResult
     func createDisplayFramebuffer() -> Bool {
         var newDisplayFramebuffer:GLuint = 0
@@ -193,5 +272,10 @@ public class RenderView:UIView, ImageConsumer {
             sharedImageProcessingContext.presentBufferForDisplay()
         }
     }
+}
+
+// Why are these flipped in the callback definition?
+private func renderViewDataProviderReleaseCallback(_ context: UnsafeMutableRawPointer?, data: UnsafeRawPointer, size: Int) {
+    data.deallocate()
 }
 #endif
